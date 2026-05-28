@@ -3,7 +3,9 @@ import cv2
 import numpy as np
 import os
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton,
-                              QVBoxLayout, QHBoxLayout, QWidget, QFileDialog)
+                              QVBoxLayout, QHBoxLayout, QWidget, QFileDialog,
+                              QDialog, QTableWidget, QTableWidgetItem,
+                              QHeaderView, QProgressBar, QScrollArea)
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtCore import Qt
 
@@ -27,8 +29,14 @@ class PlateGuardianApp(QMainWindow):
         self.btn_buka.clicked.connect(self.buka_gambar)
         self.btn_proses = QPushButton("Proses Deteksi & Baca Plat")
         self.btn_proses.clicked.connect(self.proses_gambar)
+        self.btn_akurasi = QPushButton("Uji Akurasi Dataset")
+        self.btn_akurasi.clicked.connect(self.uji_akurasi)
+        self.btn_akurasi.setStyleSheet(
+            "background-color: #2196F3; color: white; font-weight: bold; padding: 6px;"
+        )
         btn_layout.addWidget(self.btn_buka)
         btn_layout.addWidget(self.btn_proses)
+        btn_layout.addWidget(self.btn_akurasi)
         self.layout.addLayout(btn_layout)
 
         # === GAMBAR ASLI + KOTAK HIJAU ===
@@ -328,6 +336,274 @@ class PlateGuardianApp(QMainWindow):
             self.lbl_hasil.setText(f"Plat: {teks}")
         else:
             self.lbl_hasil.setText("Plat: TIDAK TERBACA")
+
+    # ============================================================
+    #  UJI AKURASI DATASET
+    #  --------------------------------------------------------
+    #  Memproses seluruh gambar di folder dataset_kendaraan,
+    #  membandingkan hasil prediksi dengan ground truth (nama file),
+    #  dan menampilkan hasil akurasi.
+    # ============================================================
+
+    def proses_satu_gambar(self, path):
+        """
+        Memproses satu gambar tanpa menampilkan ke GUI.
+        Return: string hasil prediksi plat, atau "" jika gagal.
+        """
+        img = cv2.imread(path)
+        if img is None:
+            return ""
+
+        lokasi = self.cari_lokasi_plat(img)
+        if lokasi is None:
+            return ""
+
+        x, y, w, h = lokasi
+        plat_crop = img[y:y+h, x:x+w]
+
+        if h < 50:
+            scale = 50.0 / h
+            plat_crop = cv2.resize(plat_crop, None, fx=scale, fy=scale,
+                                   interpolation=cv2.INTER_LINEAR)
+
+        # Pre-processing tanpa tampilkan ke GUI
+        gray = cv2.cvtColor(plat_crop, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, bw = cv2.threshold(blur, 0, 255,
+                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # Segmentasi karakter
+        plat_h, plat_w = bw.shape[:2]
+        contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[0])
+
+        teks = ""
+        for cnt in contours:
+            cx, cy, cw, ch = cv2.boundingRect(cnt)
+            if not (3 < cw < plat_w * 0.35
+                    and plat_h * 0.2 < ch < plat_h * 0.95):
+                continue
+            label = self.cocokkan_karakter(bw[cy:cy+ch, cx:cx+cw])
+            teks += label
+
+        return teks
+
+    def hitung_kecocokan_karakter(self, prediksi, ground_truth):
+        """
+        Menghitung jumlah karakter yang cocok antara prediksi dan ground truth.
+        Menggunakan pencocokan posisi per karakter.
+        Return: (jumlah_cocok, total_karakter_ground_truth)
+        """
+        cocok = 0
+        panjang_min = min(len(prediksi), len(ground_truth))
+        for i in range(panjang_min):
+            if prediksi[i].upper() == ground_truth[i].upper():
+                cocok += 1
+        return cocok, len(ground_truth)
+
+    def uji_akurasi(self):
+        """
+        Menguji akurasi program terhadap seluruh dataset di folder dataset_kendaraan.
+        Ground truth diambil dari nama file (tanpa ekstensi).
+        Menampilkan dialog hasil dengan tabel detail dan persentase akurasi.
+        """
+        folder = "dataset_kendaraan"
+        if not os.path.exists(folder):
+            self.lbl_hasil.setText("Folder dataset_kendaraan tidak ditemukan!")
+            return
+
+        # Kumpulkan semua gambar
+        daftar_gambar = []
+        for fname in sorted(os.listdir(folder)):
+            if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+                daftar_gambar.append(fname)
+
+        if not daftar_gambar:
+            self.lbl_hasil.setText("Tidak ada gambar di dataset_kendaraan!")
+            return
+
+        jumlah_dataset = len(daftar_gambar)
+        jumlah_benar = 0  # Full match (seluruh plat cocok)
+        total_karakter_gt = 0
+        total_karakter_cocok = 0
+        hasil_detail = []
+
+        # Proses semua gambar
+        for fname in daftar_gambar:
+            path = os.path.join(folder, fname)
+            ground_truth = os.path.splitext(fname)[0].upper()
+            prediksi = self.proses_satu_gambar(path).upper()
+
+            # Full match check
+            is_benar = (prediksi == ground_truth)
+            if is_benar:
+                jumlah_benar += 1
+
+            # Per-character accuracy
+            cocok, total_gt = self.hitung_kecocokan_karakter(prediksi, ground_truth)
+            total_karakter_cocok += cocok
+            total_karakter_gt += total_gt
+
+            hasil_detail.append({
+                'file': fname,
+                'ground_truth': ground_truth,
+                'prediksi': prediksi if prediksi else '(GAGAL DETEKSI)',
+                'status': '✔' if is_benar else '✘',
+                'karakter_cocok': f"{cocok}/{total_gt}"
+            })
+
+            QApplication.processEvents()  # Agar GUI tidak freeze
+
+        # Hitung akurasi
+        akurasi_full = (jumlah_benar / jumlah_dataset) * 100
+        akurasi_karakter = (total_karakter_cocok / total_karakter_gt * 100
+                           if total_karakter_gt > 0 else 0)
+
+        # Update bar hasil
+        self.lbl_hasil.setText(
+            f"Akurasi: {jumlah_benar}/{jumlah_dataset} benar "
+            f"= {akurasi_full:.1f}%"
+        )
+
+        # Tampilkan dialog hasil detail
+        self.tampilkan_dialog_akurasi(
+            hasil_detail, jumlah_benar, jumlah_dataset,
+            akurasi_full, akurasi_karakter,
+            total_karakter_cocok, total_karakter_gt
+        )
+
+    def tampilkan_dialog_akurasi(self, hasil_detail, jumlah_benar,
+                                  jumlah_dataset, akurasi_full,
+                                  akurasi_karakter, total_karakter_cocok,
+                                  total_karakter_gt):
+        """
+        Menampilkan dialog dengan tabel hasil pengujian akurasi.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Hasil Uji Akurasi Dataset")
+        dialog.setMinimumSize(750, 550)
+        layout = QVBoxLayout(dialog)
+
+        # === RINGKASAN AKURASI ===
+        ringkasan = QLabel(
+            f"<h2>Hasil Uji Akurasi</h2>"
+            f"<p style='font-size:14px;'>"
+            f"<b>Akurasi Full Match:</b> {jumlah_benar} / {jumlah_dataset} "
+            f"= <span style='color:#4CAF50; font-size:18px;'>"
+            f"{akurasi_full:.1f}%</span><br>"
+            f"<b>Akurasi Per-Karakter:</b> {total_karakter_cocok} / "
+            f"{total_karakter_gt} = <span style='color:#2196F3; "
+            f"font-size:18px;'>{akurasi_karakter:.1f}%</span><br><br>"
+            f"<b>Rumus:</b> (Jumlah Benar / Jumlah Dataset) × 100<br>"
+            f"<b>Perhitungan:</b> ({jumlah_benar} / {jumlah_dataset}) × 100 "
+            f"= {akurasi_full:.1f}%</p>"
+        )
+        ringkasan.setAlignment(Qt.AlignCenter)
+        ringkasan.setStyleSheet(
+            "border: 2px solid #4CAF50; background-color: #f0fff0; "
+            "padding: 15px; border-radius: 8px;"
+        )
+        layout.addWidget(ringkasan)
+
+        # === TABEL DETAIL ===
+        tabel = QTableWidget()
+        tabel.setColumnCount(5)
+        tabel.setHorizontalHeaderLabels([
+            "No", "File Gambar", "Ground Truth", "Prediksi", "Status"
+        ])
+        tabel.setRowCount(len(hasil_detail))
+
+        for i, h in enumerate(hasil_detail):
+            tabel.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+            tabel.setItem(i, 1, QTableWidgetItem(h['file']))
+            tabel.setItem(i, 2, QTableWidgetItem(h['ground_truth']))
+            tabel.setItem(i, 3, QTableWidgetItem(h['prediksi']))
+
+            status_item = QTableWidgetItem(h['status'])
+            status_item.setTextAlignment(Qt.AlignCenter)
+            if h['status'] == '✔':
+                status_item.setForeground(Qt.green)
+            else:
+                status_item.setForeground(Qt.red)
+            tabel.setItem(i, 4, status_item)
+
+        # Atur lebar kolom
+        header = tabel.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+
+        tabel.setAlternatingRowColors(True)
+        tabel.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(tabel)
+
+        # === TOMBOL ===
+        btn_layout2 = QHBoxLayout()
+
+        btn_csv = QPushButton("💾 Simpan Hasil ke CSV")
+        btn_csv.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-weight: bold; "
+            "padding: 8px; border-radius: 4px;"
+        )
+        btn_csv.clicked.connect(
+            lambda: self.simpan_csv(
+                hasil_detail, jumlah_benar, jumlah_dataset,
+                akurasi_full, akurasi_karakter,
+                total_karakter_cocok, total_karakter_gt, btn_csv
+            )
+        )
+        btn_layout2.addWidget(btn_csv)
+
+        btn_tutup = QPushButton("Tutup")
+        btn_tutup.clicked.connect(dialog.close)
+        btn_tutup.setStyleSheet(
+            "background-color: #f44336; color: white; font-weight: bold; "
+            "padding: 8px; border-radius: 4px;"
+        )
+        btn_layout2.addWidget(btn_tutup)
+        layout.addLayout(btn_layout2)
+
+        dialog.exec_()
+
+    def simpan_csv(self, hasil_detail, jumlah_benar, jumlah_dataset,
+                   akurasi_full, akurasi_karakter, total_karakter_cocok,
+                   total_karakter_gt, btn):
+        """
+        Menyimpan tabel hasil akurasi ke file CSV.
+        """
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Simpan Hasil Akurasi", "hasil_akurasi.csv",
+            "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+
+        with open(path, 'w', encoding='utf-8') as f:
+            # Header
+            f.write("No,Nama File,Plat Sebenarnya (Ground Truth),Hasil Prediksi,Keterangan\n")
+
+            # Data per gambar
+            for i, h in enumerate(hasil_detail):
+                status_text = "Benar" if h['status'] == '✔' else "Salah"
+                f.write(f"{i+1},{h['file']},{h['ground_truth']},"
+                        f"{h['prediksi']},{status_text}\n")
+
+            # Baris kosong + ringkasan
+            f.write("\n")
+            f.write(f"Jumlah Dataset,{jumlah_dataset}\n")
+            f.write(f"Jumlah Benar,{jumlah_benar}\n")
+            f.write(f"Akurasi Full Match,({jumlah_benar}/{jumlah_dataset}) x 100,{akurasi_full:.1f}%\n")
+            f.write(f"Akurasi Per-Karakter,({total_karakter_cocok}/{total_karakter_gt}) x 100,{akurasi_karakter:.1f}%\n")
+
+        # Feedback visual
+        btn.setText(f"✅ Tersimpan: {os.path.basename(path)}")
+        btn.setStyleSheet(
+            "background-color: #388E3C; color: white; font-weight: bold; "
+            "padding: 8px; border-radius: 4px;"
+        )
 
 
 if __name__ == '__main__':
